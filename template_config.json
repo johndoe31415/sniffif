@@ -1,0 +1,7 @@
+{
+	"interface":	"eth1",
+	"address":		"192.168.99.1",
+	"subnet":		24,
+	"user":			"joe",
+	"nat_if":		"eth0"
+}

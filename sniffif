@@ -1,0 +1,118 @@
+#!/usr/bin/python3
+#	sniffif - Quick setup for sniffing on a network interface
+#	Copyright (C) 2019-2019 Johannes Bauer
+#
+#	This file is part of sniffif.
+#
+#	sniffif is free software; you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation; this program is ONLY licensed under
+#	version 3 of the License, later versions are explicitly excluded.
+#
+#	sniffif is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#	GNU General Public License for more details.
+#
+#	You should have received a copy of the GNU General Public License
+#	along with sniffif; if not, write to the Free Software
+#	Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+#	Johannes Bauer <JohannesBauer@gmx.de>
+
+import sys
+import json
+import tempfile
+import subprocess
+import datetime
+import signal
+import time
+import pwd
+import os
+from FriendlyArgumentParser import FriendlyArgumentParser
+
+parser = FriendlyArgumentParser(description = "Configure a sniffing interface.")
+parser.add_argument("-c", "--config-file", metavar = "filename", type = str, default = "config.json", help = "Specifies configuration file to use. Defaults to %(default)s.")
+parser.add_argument("-v", "--verbose", action = "count", default = 0, help = "Increases verbosity. Can be specified multiple times to increase.")
+args = parser.parse_args(sys.argv[1:])
+
+with open(args.config_file) as f:
+	config = json.load(f)
+
+def int2ip(intvalue):
+	return ".".join(str(x) for x in int.to_bytes(intvalue, byteorder = "big", length = 4))
+
+user_info = pwd.getpwnam(config["user"])
+
+address_int = int.from_bytes(bytes(int(x) for x in config["address"].split(".")), byteorder = "big")
+subnet_int = ((1 << config["subnet"]) - 1) << (32 - config["subnet"])
+dhcp_min_addr = address_int + 9
+dhcp_max_addr = address_int + 98
+if (dhcp_min_addr & subnet_int) != (address_int & subnet_int):
+	raise Exception("DHCP min address %s outside subnet." % (int2ip(dhcp_min_addr)))
+if (dhcp_max_addr & subnet_int) != (address_int & subnet_int):
+	raise Exception("DHCP max address %s outside subnet." % (int2ip(dhcp_max_addr)))
+
+if args.verbose >= 1:
+	print("Interface %s/%s, DHCP range from %s to %s" % (int2ip(address_int), int2ip(subnet_int), int2ip(dhcp_min_addr), int2ip(dhcp_max_addr)))
+subprocess.check_call([ "ifconfig", config["interface"], "up", "%s/%d" % (config["address"], config["subnet"]) ])
+
+procs = [ ]
+
+try:
+	sniff_file = "sniffif_%s_%s.pcap" % (config["interface"], datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
+	if args.verbose >= 1:
+		print("Sniffing PCAP to %s" % (sniff_file))
+	sniff_process = subprocess.Popen([ "tcpdump", "-i", config["interface"], "-w", sniff_file, "-s", "0" ], stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
+	procs.append(sniff_process)
+	for i in range(10):
+		if os.path.isfile(sniff_file):
+			break
+		time.sleep(0.1)
+	os.chown(sniff_file, user_info.pw_uid, user_info.pw_gid)
+
+	# Allow NAT
+	with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
+		print("1", file = f)
+	subprocess.check_call([ "iptables", "-t", "nat", "-A", "POSTROUTING", "-o", config["nat_if"], "-j", "MASQUERADE" ])
+
+	with tempfile.NamedTemporaryFile(prefix = "sniffif_dnsmasq_", suffix = ".conf", mode = "w") as dnsmasq_conf, tempfile.NamedTemporaryFile(prefix = "sniffif_dnsmasq_", suffix = ".leases") as dnsmasq_leases:
+		os.chown(dnsmasq_conf.name, user_info.pw_uid, user_info.pw_gid)
+		os.chown(dnsmasq_leases.name, user_info.pw_uid, user_info.pw_gid)
+
+		print("interface=%s" % (config["interface"]), file = dnsmasq_conf)
+		print("bind-interfaces", file = dnsmasq_conf)
+		print("dhcp-range=%s,%s,12h" % (int2ip(dhcp_min_addr), int2ip(dhcp_max_addr)), file = dnsmasq_conf)
+		print("dhcp-leasefile=%s" % (dnsmasq_leases.name), file = dnsmasq_conf)
+		dnsmasq_conf.flush()
+		dnsmasq_cmd = [ "dnsmasq", "-C", dnsmasq_conf.name, "-k" ]
+		dnsmasq_process = subprocess.Popen(dnsmasq_cmd)
+		procs.append(dnsmasq_process)
+
+		while True:
+			cmdstr = input("> ")
+			cmdstr = cmdstr.strip()
+			if cmdstr == "":
+				continue
+
+			cmds = cmdstr.split()
+			cmd = cmds[0]
+			if cmd in [ "q", "x", "exit", "quit" ]:
+				break
+			elif cmd in [ "l", "list" ]:
+				with open(dnsmasq_leases.name) as f:
+					print(f.read())
+			elif (cmd in [ "s", "scan" ]) and (len(cmds) == 2):
+				target = cmds[1]
+				print("Scanning %s" % (target))
+				subprocess.check_call([ "nmap", "-n", "-p", "1-65535", target ])
+			else:
+				print("Unknown command: %s" % (cmd))
+finally:
+	for proc in procs:
+		proc.send_signal(signal.SIGHUP)
+	time.sleep(3)
+	for proc in procs:
+		proc.kill()
+	for proc in procs:
+		proc.wait()
