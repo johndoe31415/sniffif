@@ -30,6 +30,8 @@ import time
 import pwd
 import os
 from FriendlyArgumentParser import FriendlyArgumentParser
+from CommandInterface import CommandInterface
+from Subprocesses import TCPDumpProcess, DNSMasqProcess
 
 parser = FriendlyArgumentParser(description = "Configure a sniffing interface.")
 parser.add_argument("-c", "--config-file", metavar = "filename", type = str, default = "config.json", help = "Specifies configuration file to use. Defaults to %(default)s.")
@@ -57,62 +59,53 @@ if args.verbose >= 1:
 	print("Interface %s/%s, DHCP range from %s to %s" % (int2ip(address_int), int2ip(subnet_int), int2ip(dhcp_min_addr), int2ip(dhcp_max_addr)))
 subprocess.check_call([ "ifconfig", config["interface"], "up", "%s/%d" % (config["address"], config["subnet"]) ])
 
-procs = [ ]
-
+procs = { }
+uid_gid = (user_info.pw_uid, user_info.pw_gid)
 try:
+	# Start TCPDump
 	sniff_file = "sniffif_%s_%s.pcap" % (config["interface"], datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
 	if args.verbose >= 1:
 		print("Sniffing PCAP to %s" % (sniff_file))
-	sniff_process = subprocess.Popen([ "tcpdump", "-i", config["interface"], "-w", sniff_file, "-s", "0" ], stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
-	procs.append(sniff_process)
-	for i in range(10):
-		if os.path.isfile(sniff_file):
-			break
-		time.sleep(0.1)
-	os.chown(sniff_file, user_info.pw_uid, user_info.pw_gid)
+	procs["tcpdump"] = TCPDumpProcess(interface = config["interface"], outfile = sniff_file, uid_gid = uid_gid)
 
 	# Allow NAT
 	with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
 		print("1", file = f)
 	subprocess.check_call([ "iptables", "-t", "nat", "-A", "POSTROUTING", "-o", config["nat_if"], "-j", "MASQUERADE" ])
 
-	with tempfile.NamedTemporaryFile(prefix = "sniffif_dnsmasq_", suffix = ".conf", mode = "w") as dnsmasq_conf, tempfile.NamedTemporaryFile(prefix = "sniffif_dnsmasq_", suffix = ".leases") as dnsmasq_leases:
-		os.chown(dnsmasq_conf.name, user_info.pw_uid, user_info.pw_gid)
-		os.chown(dnsmasq_leases.name, user_info.pw_uid, user_info.pw_gid)
+	# Start DNS and DHCP server
+	procs["dnsmasq"] = DNSMasqProcess(interface = config["interface"], dhcp_range = (int2ip(dhcp_min_addr), int2ip(dhcp_max_addr)), uid_gid = uid_gid)
 
-		print("interface=%s" % (config["interface"]), file = dnsmasq_conf)
-		print("bind-interfaces", file = dnsmasq_conf)
-		print("dhcp-range=%s,%s,12h" % (int2ip(dhcp_min_addr), int2ip(dhcp_max_addr)), file = dnsmasq_conf)
-		print("dhcp-leasefile=%s" % (dnsmasq_leases.name), file = dnsmasq_conf)
-		dnsmasq_conf.flush()
-		dnsmasq_cmd = [ "dnsmasq", "-C", dnsmasq_conf.name, "-k" ]
-		dnsmasq_process = subprocess.Popen(dnsmasq_cmd)
-		procs.append(dnsmasq_process)
+	shared_data = {
+		"dnsmasq_lease_file":	procs["dnsmasq"].tmpname("leases"),
+	}
+	cmdif = CommandInterface(shared_data)
+	cmdif.command_loop()
 
-		while True:
-			cmdstr = input("> ")
-			cmdstr = cmdstr.strip()
-			if cmdstr == "":
-				continue
-
-			cmds = cmdstr.split()
-			cmd = cmds[0]
-			if cmd in [ "q", "x", "exit", "quit" ]:
-				break
-			elif cmd in [ "l", "list" ]:
-				with open(dnsmasq_leases.name) as f:
-					print(f.read())
-			elif (cmd in [ "s", "scan" ]) and (len(cmds) == 2):
-				target = cmds[1]
-				print("Scanning %s" % (target))
-				subprocess.check_call([ "nmap", "-n", "-p", "1-65535", target ])
-			else:
-				print("Unknown command: %s" % (cmd))
+#		while True:
+#			cmdstr = input("> ")
+#			cmdstr = cmdstr.strip()
+#			if cmdstr == "":
+#				continue
+#
+	#		cmds = cmdstr.split()
+	#		cmd = cmds[0]
+	#		if cmd in [ "q", "x", "exit", "quit" ]:
+	#			break
+	#		elif cmd in [ "l", "list" ]:
+	#			with open(dnsmasq_leases.name) as f:
+	#				print(f.read())
+	#		elif (cmd in [ "s", "scan" ]) and (len(cmds) == 2):
+	#			target = cmds[1]
+	#			print("Scanning %s" % (target))
+	#			subprocess.check_call([ "nmap", "-n", "-p", "1-65535", target ])
+	#		else:
+	#			print("Unknown command: %s" % (cmd))
 finally:
-	for proc in procs:
-		proc.send_signal(signal.SIGHUP)
-	time.sleep(3)
-	for proc in procs:
-		proc.kill()
-	for proc in procs:
-		proc.wait()
+	for proc in procs.values():
+		proc.proc.send_signal(signal.SIGHUP)
+	time.sleep(1)
+	for proc in procs.values():
+		proc.proc.kill()
+	for proc in procs.values():
+		proc.proc.wait()
