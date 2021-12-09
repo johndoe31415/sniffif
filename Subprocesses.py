@@ -31,7 +31,7 @@ class TCPDumpProcess(TempfileProcess):
 		self._start()
 
 	def _cmdline(self):
-		return [ "tcpdump", "-i", self._interface, "-w", self._outfile, "-s", "0" ]
+		return [ "tcpdump", "--packet-buffered", "-i", self._interface, "-w", self._outfile, "-s", "0" ]
 
 	def _post_start(self):
 		if self._uid_gid is not None:
